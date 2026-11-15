@@ -13,6 +13,9 @@ Key measures
 - habit_move      : the player's most frequent earlier move in this position (their stored answer).
 - habit_match     : 1 if they played it now (only defined when seen_before >= MIN_SEEN).
 - time_spent      : seconds used on the move (clock before - clock after + increment).
+                    Missing for each side's first move: Lichess adds no increment there and
+                    tournament 'berserk' halves the clock, so that move's time is not comparable.
+- berserk         : 1 if this side started with about half its clock (tournament berserk).
 - clock_frac      : remaining clock as a fraction of the starting clock (within-game cost).
 - eval_loss_cp    : centipawn loss of the move, from [%eval] before and after (if available).
 
@@ -135,7 +138,8 @@ def extract_moves(paths, players):
         if cls is None:
             continue
         board = g.board()
-        prev_clock = {chess.WHITE: float(base), chess.BLACK: float(base)}
+        prev_clock = {chess.WHITE: None, chess.BLACK: None}  # set from each side's first clock
+        berserk = {chess.WHITE: 0, chess.BLACK: 0}
         prev_eval = 20.0  # small white edge at the start
         node = g
         ply = 0
@@ -151,7 +155,10 @@ def extract_moves(paths, players):
             clk = parse_clock(nxt.comment)
             spent = None
             if clk is not None:
-                spent = max(0.0, prev_clock[mover] - clk + (inc or 0))
+                if prev_clock[mover] is None:          # this side's first move
+                    berserk[mover] = int(base > 0 and clk <= 0.55 * base)
+                else:
+                    spent = max(0.0, prev_clock[mover] - clk + (inc or 0))
                 prev_clock[mover] = clk
             ev = parse_eval(nxt.comment)
             loss = None
@@ -170,7 +177,7 @@ def extract_moves(paths, players):
                     seen_before=seen, habit_move=habit,
                     habit_match=(int(move == habit) if seen >= MIN_SEEN else None),
                     habit_share=(past[habit] / seen if seen else None),
-                    time_spent=spent, clock=clk,
+                    time_spent=spent, clock=clk, berserk=berserk[mover],
                     clock_frac=(clk / base if clk is not None and base else None),
                     eval_after=ev, eval_loss_cp=loss,
                 ))
