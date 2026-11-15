@@ -55,8 +55,21 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     cols = ["player", "game", "ply", "time_class", "move", "epd", "seen_before", "struct_seen"] + list(HABITS.values())
+    import pyarrow.parquet as pq
+    if "variant" in pq.ParquetFile(a.parquet[0]).schema_arrow.names:
+        cols.append("variant")
     d = pd.concat([pd.read_parquet(p, columns=cols) for p in a.parquet], ignore_index=True)
+    if "variant" not in d:
+        d["variant"] = "standard"
+    other = ~d.variant.isin(["standard", "chess960"])
+    if other.any():   # Stockfish plays only standard chess and Chess960
+        print(f"skipping {int(other.sum()):,} moves of other variants (need Fairy-Stockfish)", file=sys.stderr)
+        d = d[~other]
     d = d[d.epd.notna() & (d.seen_before == 0) & (d.struct_seen >= 3) & (d.ply >= 2)]
+    if d.empty:
+        print("no moves to evaluate", file=sys.stderr)
+        pd.DataFrame(columns=["player", "game", "ply"]).to_parquet(a.out, index=False)
+        return
     d["fast"] = d.time_class.isin(["bullet", "blitz"])
     half = a.n // 2
     sample = pd.concat([g.sample(min(half, len(g)), random_state=a.seed) for _, g in d.groupby("fast")])
@@ -68,7 +81,7 @@ def main(argv=None):
     limit = chess.engine.Limit(depth=a.depth)
     out = []
     for i, r in enumerate(sample.itertuples(index=False), 1):
-        board = chess.Board()
+        board = chess.Board(chess960=(r.variant == "chess960"))
         board.set_epd(r.epd)
         best = eng.analyse(board, limit)
         best_cp = score_cp(best, board.turn)

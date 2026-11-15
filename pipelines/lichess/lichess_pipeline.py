@@ -46,6 +46,9 @@ K_habit (usual legal move pattern), K_match (played it; defined when K_seen >= M
 - goal_*          : subgoals: where the player's pieces went (piece@square) within 3 own moves after
                     earlier visits to this kind; goal_match = current move lands on one of the top 3
                     (possibly by a different route than before).
+- variant         : game type (standard, chess960, crazyhouse, atomic, antichess, ...). Run each game type
+                    as a separate file so each type has its own memory; IDs are the same across files.
+                    Crazyhouse drops are patterns like 'NN@f3'; pieces in hand count as material in `kind`.
 - epd             : the position, stored only for similar-but-not-identical positions and a 1% sample
                     (for engine checks); the output stays in the user's private Drive.
 
@@ -185,6 +188,10 @@ def struct_key(board):
     mat = "".join(str(len(board.pieces(pt, c)))
                   for c in (chess.WHITE, chess.BLACK)
                   for pt in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN))
+    pockets = getattr(board, "pockets", None)        # crazyhouse: pieces in hand are material too
+    if pockets is not None:
+        mat += "h" + "".join(str(pockets[c].count(pt)) for c in (chess.WHITE, chess.BLACK)
+                             for pt in (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN))
     return hash64(f"{int(board.turn)}:{wp:x}:{bp:x}:{mat}")
 
 
@@ -218,7 +225,10 @@ def square_distance(a, b):
 
 
 def move_pattern(board, move):
-    """Piece letter + from + to, e.g. 'Nb1c3'. Promotion suffix kept by uci()."""
+    """Piece letter + from + to, e.g. 'Nb1c3'. Promotion suffix kept by uci().
+    Crazyhouse drops have no 'from' square: 'NN@f3' (piece letter + UCI drop)."""
+    if move.drop:
+        return sys.intern(chess.piece_symbol(move.drop).upper() + move.uci())
     return sys.intern(board.piece_at(move.from_square).symbol().upper() + move.uci())
 
 
@@ -228,6 +238,8 @@ def legal_pattern(board, pattern):
         mv = chess.Move.from_uci(pattern[1:])
     except ValueError:
         return False
+    if mv.drop:
+        return mv in board.legal_moves and chess.piece_symbol(mv.drop).upper() == pattern[0]
     pc = board.piece_at(mv.from_square)
     return mv in board.legal_moves and pc is not None and pc.symbol().upper() == pattern[0]
 
@@ -268,7 +280,7 @@ def _schema():
     import pyarrow as pa
     f64, i64, s = pa.float64(), pa.int64(), pa.string()
     return pa.schema([
-        ("player", s), ("game", i64), ("time_class", s), ("speed", s), ("base", i64), ("inc", i64),
+        ("player", s), ("variant", s), ("game", i64), ("time_class", s), ("speed", s), ("base", i64), ("inc", i64),
         ("rating", f64), ("ply", i64), ("pos", i64), ("kind", i64), ("move", s), ("n_legal", i64),
         ("seen_before", i64), ("habit_move", s), ("habit_match", f64), ("habit_share", f64),
         ("struct_seen", i64), ("struct_habit_move", s), ("struct_habit_match", f64),
@@ -338,6 +350,8 @@ def extract_moves(paths, players, out_path, ids, chunk_rows=100_000):
         if cls is None:
             continue
         board = g.board()
+        variant = ("chess960" if h.is_chess960() else
+                   h.get("Variant", "Standard").strip().lower().replace(" ", "").replace("-", ""))
         prev_clock = {chess.WHITE: None, chess.BLACK: None}  # set from each side's first clock
         berserk = {chess.WHITE: 0, chess.BLACK: 0}
         prev_eval = 20.0  # small white edge at the start
@@ -449,7 +463,7 @@ def extract_moves(paths, players, out_path, ids, chunk_rows=100_000):
                     epd=(board.epd() if store_epd else None),
                 )
                 rows.append(dict(**extra,
-                    player=ids[name], game=gi, time_class=cls, speed=SPEED[cls],
+                    player=ids[name], variant=variant, game=gi, time_class=cls, speed=SPEED[cls],
                     base=base, inc=inc, rating=rt, ply=ply, pos=pos, kind=kind,
                     move=move, n_legal=board.legal_moves.count(),
                     seen_before=seen, habit_move=habit,
