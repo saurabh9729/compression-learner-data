@@ -8,6 +8,8 @@ Stockfish evaluates:
     only, own setup, reply to the opponent's last move, own two-move chunk), even when the
     player did NOT play it.
 This shows where a stored answer would have been wrong: the summary's "exceptions".
+It also records the best move of a 1-ply search ("shallow look"), so moves can be classed as
+matching a quick look versus only a deep calculation.
 
 Losses are in centipawns from the mover's point of view (best minus candidate, >= 0, mates
 capped at 1000). Output: one row per sampled move with player/game/ply keys for merging.
@@ -24,7 +26,8 @@ import pandas as pd
 
 MATE_CP = 1000
 HABITS = {"kind": "struct_habit_move", "pawn": "pawn_habit", "own": "own_habit",
-          "reply": "reply_habit", "chunk": "chunk_habit"}
+          "reply": "reply_habit", "chunk": "chunk_habit", "cond": "cond_habit",
+          "global": "global_habit"}
 
 
 def score_cp(info, turn):
@@ -80,8 +83,11 @@ def main(argv=None):
             return max(0, best_cp - cache[mv])
 
         played = chess.Move.from_uci(r.move)
+        shallow = eng.analyse(board, chess.engine.Limit(depth=1))
+        shallow_mv = shallow["pv"][0] if shallow.get("pv") else None
         row = dict(player=r.player, game=r.game, ply=r.ply, best_move=best_mv.uci() if best_mv else None,
-                   best_cp=best_cp, loss_played=loss_of(played))
+                   best_cp=best_cp, loss_played=loss_of(played),
+                   shallow_move=shallow_mv.uci() if shallow_mv else None, loss_shallow=loss_of(shallow_mv))
         for k, col in HABITS.items():
             row[f"loss_{k}_habit"] = loss_of(pattern_move(board, getattr(r, col)))
         out.append(row)

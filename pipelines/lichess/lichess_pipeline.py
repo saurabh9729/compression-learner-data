@@ -39,6 +39,13 @@ K_habit (usual legal move pattern), K_match (played it; defined when K_seen >= M
                     group (bullet+blitz vs rapid+classical) / only in the other group.
 - kind_dist       : squares that differ from the last position of the same kind the player met.
 - result          : game result for the mover (1, 0.5, 0); opp_rating; time_forfeit (game ended on time).
+- cond            : reply to the opponent's last move within this pawn structure (conditional sub-rule).
+- global_*        : default policy: the player's favourite move patterns overall (same colour), ignoring
+                    the state. global_logp = log probability of the played move under this policy
+                    (add-one smoothing over legal moves); policy compression predicts it rises with cost.
+- goal_*          : subgoals: where the player's pieces went (piece@square) within 3 own moves after
+                    earlier visits to this kind; goal_match = current move lands on one of the top 3
+                    (possibly by a different route than before).
 - epd             : the position, stored only for similar-but-not-identical positions and a 1% sample
                     (for engine checks); the output stays in the user's private Drive.
 
@@ -274,10 +281,13 @@ def _schema():
         ("kind_other_seen", i64), ("kind_other_match", f64),
         ("kind_dist", i64), ("result", f64), ("opp_rating", f64), ("time_forfeit", i64),
         ("epd", s),
+        # v4: default policy (state-independent), subgoals
+        ("global_seen", i64), ("global_habit", s), ("global_match", f64), ("global_share", f64),
+        ("global_logp", f64), ("goal_seen", i64), ("goal_top", s), ("goal_match", f64),
     ])
 
 
-EXTRA_KEYS = ("pawn", "own", "reply", "chunk")
+EXTRA_KEYS = ("pawn", "own", "reply", "chunk", "cond")
 
 
 SPEED = {"bullet": "fast", "blitz": "medium", "rapid": "slow", "classical": "slow"}
@@ -305,6 +315,8 @@ def extract_moves(paths, players, out_path, ids, chunk_rows=100_000):
     xmem = {k: Memory() for k in EXTRA_KEYS}  # other summaries and chunks
     spmem = Memory()                           # kind of position, split by speed group
     lastboard = {}                             # (player, kind) -> last board as 64 characters
+    gpol = collections.defaultdict(collections.Counter)  # (player, colour) -> all move patterns
+    goalmem = Memory()                         # (player, kind) -> destinations of next 3 own moves
     pidx = {name: i for i, name in enumerate(sorted(players))}   # small int per player for keys
     rows, n_rows = [], 0
     writer = pq.ParquetWriter(out_path, schema)
@@ -333,6 +345,8 @@ def extract_moves(paths, players, out_path, ids, chunk_rows=100_000):
         white_score = {"1-0": 1.0, "0-1": 0.0, "1/2-1/2": 0.5}.get(res)
         forfeit = int("time" in h.get("Termination", "").lower())
         own_hist = {chess.WHITE: [], chess.BLACK: []}   # this game's own move patterns
+        own_dest = {chess.WHITE: [], chess.BLACK: []}   # this game's own destinations ('N@d5')
+        pending_goals = []                               # (kind key, own move index, colour)
         last_pat = None                                  # opponent's last move pattern
         node = g
         ply = 0
@@ -384,6 +398,7 @@ def extract_moves(paths, players, out_path, ids, chunk_rows=100_000):
                     "reply": hash64(f"R{int(mover)}:{last_pat}") if last_pat else None,
                     "chunk": (hash64(f"C{int(mover)}:{own_hist[mover][-2]}>{own_hist[mover][-1]}")
                               if len(own_hist[mover]) >= 2 else None),
+                    "cond": (hash64(f"Q{int(mover)}:{last_pat}:{pawn_key(board)}") if last_pat else None),
                 }
                 extra = {}
                 for k, kv in xkeys.items():
@@ -394,6 +409,28 @@ def extract_moves(paths, players, out_path, ids, chunk_rows=100_000):
                     extra.update({f"{k}_seen": xs, f"{k}_habit": xh,
                                   f"{k}_match": (float(pat == xh) if xs >= MIN_SEEN and xh else None),
                                   f"{k}_share": xsh})
+                # default policy: the player's favourite move patterns overall, ignoring the state
+                gc = gpol[(pi, mover)]
+                gseen = sum(gc.values()) if gc else 0
+                legal_pats = [move_pattern(board, m) for m in board.legal_moves]
+                cnts = [gc.get(q, 0) for q in legal_pats]
+                denom = sum(cnts) + len(legal_pats)          # add-one smoothing over legal moves
+                gbest = max(range(len(cnts)), key=cnts.__getitem__) if cnts and max(cnts) > 0 else None
+                ghabit = legal_pats[gbest] if gbest is not None else None
+                # subgoals: where the player's pieces usually went within 3 moves in this kind
+                gpast = goalmem.get(kkey)
+                goal_seen = sum(gpast.values())
+                top3 = [q for q, _ in gpast.most_common(3)]
+                dest = sys.intern(pat[0] + "@" + chess.square_name(nxt.move.to_square))
+                extra.update(
+                    global_seen=gseen, global_habit=ghabit,
+                    global_match=(float(pat == ghabit) if gseen >= MIN_SEEN and ghabit else None),
+                    global_share=(gc[ghabit] / gseen if ghabit else None),
+                    global_logp=math.log((gc.get(pat, 0) + 1) / denom) if denom else None,
+                    goal_seen=goal_seen, goal_top=(top3[0] if top3 else None),
+                    goal_match=(float(dest in top3) if goal_seen >= MIN_SEEN else None),
+                )
+                pending_goals.append((kkey, len(own_hist[mover]), mover))
                 sg = 0 if cls in ("bullet", "blitz") else 1
                 same_s, same_h, _ = lookup(spmem, kkey * 2 + sg, board)
                 oth_s, oth_h, _ = lookup(spmem, kkey * 2 + (1 - sg), board)
@@ -432,6 +469,7 @@ def extract_moves(paths, players, out_path, ids, chunk_rows=100_000):
                         xmem[k].add(kv * 4096 + pi, pat)
                 spmem.add(kkey * 2 + sg, pat)
                 lastboard[kkey] = cur
+                gc[pat] += 1
                 if len(rows) >= chunk_rows:
                     flush()
                     print(f"{n_rows:,} moves written ({gi + 1:,} of {len(games):,} games)",
@@ -439,10 +477,15 @@ def extract_moves(paths, players, out_path, ids, chunk_rows=100_000):
             prev_eval = ev if ev is not None else None
             mp = move_pattern(board, nxt.move)
             own_hist[mover].append(mp)
+            own_dest[mover].append(sys.intern(mp[0] + "@" + chess.square_name(nxt.move.to_square)))
             last_pat = mp
             board.push(nxt.move)
             node = nxt
             ply += 1
+        # game over: store where each visited kind led within the next 3 own moves (subgoals)
+        for kk, i, col in pending_goals:
+            for dst in set(own_dest[col][i:i + 3]):
+                goalmem.add(kk, dst)
     flush()
     writer.close()
     return n_rows
