@@ -3,3 +3,5 @@
 *.pgn.zst
 counts*.csv
 players*.txt
+__pycache__/
+*.pyc

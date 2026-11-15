@@ -9,6 +9,8 @@ Pipelines that pull large public datasets on GitHub's servers and keep only comp
 - `pipelines/lichess/engine_eval.py`: Stockfish check of reused answers in similar positions (best, played, and usual move under each stored representation).
 - `colab/`: free alternative to Actions. Open `colab/lichess_extract.ipynb` in Google Colab; it runs the same pipeline code and saves the anonymised outputs to your Google Drive.
 
+- `colab/ednet_extract_PRIVATE.ipynb`: EdNet notebook. **Code only**: it saves EdNet outputs to the user's private Drive (`ednet-private/`); no EdNet data is ever committed here.
+
 ## ⚠ This repo is PUBLIC
 Everything committed here, and every Actions log, can be read by anyone.
 
