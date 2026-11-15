@@ -1,0 +1,66 @@
+name: lichess-extract
+
+# Runs on GitHub's servers (which can reach database.lichess.org).
+# Trigger: edit pipelines/lichess/run.env and push, or start it by hand from the Actions tab.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "pipelines/lichess/run.env"
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load settings
+        run: cat pipelines/lichess/run.env >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq zstd
+          pip install -q chess pandas pyarrow zstandard
+
+      - name: Pass 1, count games per player (streamed, nothing stored)
+        run: |
+          mkdir -p processed/lichess
+          URL="https://database.lichess.org/standard/lichess_db_standard_rated_${MONTH}.pgn.zst"
+          curl -sL "$URL" | zstdcat | python pipelines/lichess/filter_lichess.py --count processed/lichess/counts_${MONTH}.csv
+          wc -l processed/lichess/counts_${MONTH}.csv
+
+      - name: Select players who play both bullet and slow games
+        run: |
+          python pipelines/lichess/select_players.py processed/lichess/counts_${MONTH}.csv \
+            --min-bullet "$MIN_BULLET" --min-slow "$MIN_SLOW" --n "$N_PLAYERS" \
+            --out processed/lichess/players_${MONTH}.txt
+
+      - name: Pass 2, keep only their games (streamed)
+        run: |
+          URL="https://database.lichess.org/standard/lichess_db_standard_rated_${MONTH}.pgn.zst"
+          curl -sL "$URL" | zstdcat | python pipelines/lichess/filter_lichess.py --extract processed/lichess/players_${MONTH}.txt \
+            | zstd -q -19 -o processed/lichess/filtered_${MONTH}.pgn.zst
+          ls -lh processed/lichess/
+
+      - name: Per-move measures
+        run: |
+          python pipelines/lichess/lichess_pipeline.py processed/lichess/filtered_${MONTH}.pgn.zst \
+            --players processed/lichess/players_${MONTH}.txt --out processed/lichess/moves_${MONTH}.parquet
+          ls -lh processed/lichess/
+
+      - name: Commit results (counts file dropped if too large)
+        run: |
+          find processed -size +95M -print -delete
+          git config user.name "lichess-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add processed
+          git commit -m "Lichess extract ${MONTH}" || echo "nothing to commit"
+          git pull --rebase && git push
