@@ -5,6 +5,8 @@ Input : PGN files from the Lichess open database (database.lichess.org, .pgn or 
         or per-user API exports (lichess.org/api/games/user/<name>?clocks=true&evals=true).
         Games need [%clk] comments; [%eval] comments are used when present.
 Output: one row per move (parquet) with the measures below, plus a per-player summary.
+        Positions are stored as 64-bit hashes: `pos` (exact position) and `kind` (pawn skeleton +
+        material + side to move), to keep files small. Raw positions can be rebuilt from the games.
 
 Key measures
 - time_class      : bullet / blitz / rapid / classical (Lichess rule: base + 40 * increment).
@@ -12,6 +14,14 @@ Key measures
                     in earlier games, in any time control.
 - habit_move      : the player's most frequent earlier move in this position (their stored answer).
 - habit_match     : 1 if they played it now (only defined when seen_before >= MIN_SEEN).
+- struct_seen     : how often this player had faced a position of the same KIND: same pawn
+                    skeleton, same material, same side to move (pieces may stand elsewhere).
+                    Exact positions rarely repeat after the opening; kinds of position do.
+- struct_habit_move, struct_habit_match, struct_habit_share: the player's most frequent
+                    earlier move pattern (piece + from + to) in this kind of position, among
+                    patterns that are legal now; whether they played it (struct_seen >= MIN_SEEN);
+                    and how dominant it was. Positions with seen_before == 0 but struct_seen >= 3
+                    are 'similar but not identical': where a stored answer is reused by analogy.
 - time_spent      : seconds used on the move (clock before - clock after + increment).
                     Missing for each side's first move: Lichess adds no increment there and
                     tournament 'berserk' halves the clock, so that move's time is not comparable.
@@ -120,19 +130,134 @@ def select_players(counts, min_games, classes=("bullet", "classical")):
     return {p for p, c in counts.items() if all(c[k] >= min_games for k in classes)}
 
 
-def game_order_key(g):
-    return (g.headers.get("UTCDate", ""), g.headers.get("UTCTime", ""))
+def iter_raw_games(paths, players):
+    """Raw text of games involving the selected players, with their sort key.
+
+    Games are kept as text (about 2 KB each) and parsed one at a time later, so a whole
+    month fits in memory; parsed games are about 20 times larger."""
+    for p in paths:
+        with open_text(p) as fh:
+            lines, heads, in_moves = [], {}, False
+            for line in fh:
+                if line.startswith("[") and in_moves:
+                    if heads.get("White") in players or heads.get("Black") in players:
+                        yield (heads.get("UTCDate", ""), heads.get("UTCTime", "")), "".join(lines)
+                    lines, heads, in_moves = [], {}, False
+                lines.append(line)
+                if line.startswith("["):
+                    k, _, v = line[1:].partition(" ")
+                    heads[k] = v.rstrip().rstrip("]").strip('"')
+                elif line.strip():
+                    in_moves = True
+            if lines and (heads.get("White") in players or heads.get("Black") in players):
+                yield (heads.get("UTCDate", ""), heads.get("UTCTime", "")), "".join(lines)
 
 
-def extract_moves(paths, players):
-    """Second pass: one row per move by a selected player, in chronological order per player."""
-    games = [g for g in iter_games(paths)
-             if g.headers.get("White") in players or g.headers.get("Black") in players]
-    games.sort(key=game_order_key)
+def hash64(text):
+    """Stable signed 64-bit hash (used for position keys in memory and in the output)."""
+    return int.from_bytes(hashlib.blake2b(text.encode(), digest_size=8).digest(), "big", signed=True)
 
-    memory = collections.defaultdict(collections.Counter)  # (player, epd) -> Counter(move)
-    rows = []
-    for gi, g in enumerate(games):
+
+def struct_key(board):
+    """Kind of position: pawn skeleton + material + side to move."""
+    wp = int(board.pieces(chess.PAWN, chess.WHITE))
+    bp = int(board.pieces(chess.PAWN, chess.BLACK))
+    mat = "".join(str(len(board.pieces(pt, c)))
+                  for c in (chess.WHITE, chess.BLACK)
+                  for pt in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN))
+    return hash64(f"{int(board.turn)}:{wp:x}:{bp:x}:{mat}")
+
+
+def move_pattern(board, move):
+    """Piece letter + from + to, e.g. 'Nb1c3'. Promotion suffix kept by uci()."""
+    return sys.intern(board.piece_at(move.from_square).symbol().upper() + move.uci())
+
+
+def legal_pattern(board, pattern):
+    """Is this stored pattern (same piece, same squares) playable in the current position?"""
+    try:
+        mv = chess.Move.from_uci(pattern[1:])
+    except ValueError:
+        return False
+    pc = board.piece_at(mv.from_square)
+    return mv in board.legal_moves and pc is not None and pc.symbol().upper() == pattern[0]
+
+
+class Memory:
+    """What each player did before, per key: key -> one move (seen once) or a Counter.
+
+    Most positions are met only once, so storing a single interned string for them
+    (instead of a Counter) keeps a month of history within a few GB."""
+
+    def __init__(self):
+        self.d = {}
+
+    def get(self, key):
+        v = self.d.get(key)
+        if v is None:
+            return collections.Counter()
+        if isinstance(v, str):
+            return collections.Counter({v: 1})
+        return v
+
+    def add(self, key, item):
+        v = self.d.get(key)
+        if v is None:
+            self.d[key] = item
+        elif isinstance(v, str):
+            c = collections.Counter({v: 1})
+            c[item] += 1
+            self.d[key] = c
+        else:
+            v[item] += 1
+
+
+SCHEMA = None  # built lazily (pyarrow imported only when writing)
+
+
+def _schema():
+    import pyarrow as pa
+    f64, i64, s = pa.float64(), pa.int64(), pa.string()
+    return pa.schema([
+        ("player", s), ("game", i64), ("time_class", s), ("speed", s), ("base", i64), ("inc", i64),
+        ("rating", f64), ("ply", i64), ("pos", i64), ("kind", i64), ("move", s), ("n_legal", i64),
+        ("seen_before", i64), ("habit_move", s), ("habit_match", f64), ("habit_share", f64),
+        ("struct_seen", i64), ("struct_habit_move", s), ("struct_habit_match", f64),
+        ("struct_habit_share", f64), ("time_spent", f64), ("clock", f64), ("berserk", i64),
+        ("clock_frac", f64), ("eval_after", f64), ("eval_loss_cp", f64),
+    ])
+
+
+SPEED = {"bullet": "fast", "blitz": "medium", "rapid": "slow", "classical": "slow"}
+
+
+def extract_moves(paths, players, out_path, ids, chunk_rows=100_000):
+    """Second pass: one row per move by a selected player, in chronological order per player.
+
+    Writes the parquet file in chunks (player names already replaced by `ids`)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    schema = _schema()
+    games = sorted(iter_raw_games(paths, players), key=lambda t: t[0])
+    print(f"games to process: {len(games)}", file=sys.stderr, flush=True)
+
+    memory, smemory = Memory(), Memory()   # exact position / kind of position
+    pidx = {name: i for i, name in enumerate(sorted(players))}   # small int per player for keys
+    rows, n_rows = [], 0
+    writer = pq.ParquetWriter(out_path, schema)
+
+    def flush():
+        nonlocal rows, n_rows
+        if rows:
+            writer.write_table(pa.Table.from_pylist(rows, schema=schema))
+            n_rows += len(rows)
+            rows = []
+
+    for gi in range(len(games)):
+        g = chess.pgn.read_game(io.StringIO(games[gi][1]))
+        games[gi] = None                     # free the text once parsed
+        if g is None:
+            continue
         h = g.headers
         cls, base, inc = time_class(h.get("TimeControl"))
         if cls is None:
@@ -148,9 +273,6 @@ def extract_moves(paths, players):
             mover = board.turn
             name = h.get("White") if mover == chess.WHITE else h.get("Black")
             rating = h.get("WhiteElo") if mover == chess.WHITE else h.get("BlackElo")
-            epd = board.epd()
-            move = nxt.move.uci()
-            n_legal = board.legal_moves.count()
 
             clk = parse_clock(nxt.comment)
             spent = None
@@ -167,26 +289,48 @@ def extract_moves(paths, players):
                 loss = max(0.0, sign * (prev_eval - ev))
 
             if name in players:
-                past = memory[(name, epd)]
+                move = sys.intern(nxt.move.uci())
+                pos = hash64(board.epd())
+                kind = struct_key(board)
+                pkey, kkey = pos * 4096 + pidx[name], kind * 4096 + pidx[name]  # one int per key
+                past = memory.get(pkey)
                 seen = sum(past.values())
                 habit = past.most_common(1)[0][0] if seen else None
+                pat = move_pattern(board, nxt.move)
+                spast = smemory.get(kkey)
+                sseen = sum(spast.values())
+                shabit = next((q for q, _ in spast.most_common() if legal_pattern(board, q)), None)
+                try:
+                    rt = float(rating)
+                except (TypeError, ValueError):
+                    rt = None
                 rows.append(dict(
-                    player=name, game=gi, time_class=cls,
-                    base=base, inc=inc, rating=pd.to_numeric(rating, errors="coerce"),
-                    ply=ply, epd=epd, move=move, n_legal=n_legal,
+                    player=ids[name], game=gi, time_class=cls, speed=SPEED[cls],
+                    base=base, inc=inc, rating=rt, ply=ply, pos=pos, kind=kind,
+                    move=move, n_legal=board.legal_moves.count(),
                     seen_before=seen, habit_move=habit,
-                    habit_match=(int(move == habit) if seen >= MIN_SEEN else None),
+                    habit_match=(float(move == habit) if seen >= MIN_SEEN else None),
                     habit_share=(past[habit] / seen if seen else None),
+                    struct_seen=sseen, struct_habit_move=shabit,
+                    struct_habit_match=(float(pat == shabit) if sseen >= MIN_SEEN and shabit else None),
+                    struct_habit_share=(spast[shabit] / sseen if shabit else None),
                     time_spent=spent, clock=clk, berserk=berserk[mover],
                     clock_frac=(clk / base if clk is not None and base else None),
                     eval_after=ev, eval_loss_cp=loss,
                 ))
-                past[move] += 1
+                memory.add(pkey, move)
+                smemory.add(kkey, pat)
+                if len(rows) >= chunk_rows:
+                    flush()
+                    print(f"{n_rows:,} moves written ({gi + 1:,} of {len(games):,} games)",
+                          file=sys.stderr, flush=True)
             prev_eval = ev if ev is not None else None
             board.push(nxt.move)
             node = nxt
             ply += 1
-    return pd.DataFrame(rows)
+    flush()
+    writer.close()
+    return n_rows
 
 
 def player_summary(df):
@@ -198,7 +342,12 @@ def player_summary(df):
               .reset_index())
     nov = (df[df.seen_before == 0].groupby(["player", "time_class"])
              .agg(median_time_novel=("time_spent", "median")).reset_index())
-    return out.merge(nov, on=["player", "time_class"], how="outer")
+    near = (df[(df.seen_before == 0) & df.struct_habit_match.notna()]
+              .groupby(["player", "time_class"])
+              .agg(near_moves=("struct_habit_match", "size"),
+                   near_match_rate=("struct_habit_match", "mean")).reset_index())
+    out = out.merge(nov, on=["player", "time_class"], how="outer")
+    return out.merge(near, on=["player", "time_class"], how="outer")
 
 
 def anonymize(names):
@@ -224,18 +373,17 @@ def main(argv=None):
         counts = count_games(a.pgn)
         players = select_players(counts, a.min_games)
     print(f"players: {len(players)}", file=sys.stderr)
-    df = extract_moves(a.pgn, players)
-    df["speed"] = df.time_class.map({"bullet": "fast", "blitz": "medium",
-                                     "rapid": "slow", "classical": "slow"})
     ids = anonymize(sorted(players))
-    df["player"] = df["player"].map(ids)
-    df.to_parquet(a.out, index=False)
+    n = extract_moves(a.pgn, players, a.out, ids)
+    cols = ["player", "time_class", "seen_before", "habit_match", "time_spent",
+            "struct_habit_match"]
+    df = pd.read_parquet(a.out, columns=cols)
     summ = player_summary(df)
     summ.to_csv(a.out.replace(".parquet", "_players.csv"), index=False)
     # Totals only: logs of a public repo are public.
-    print(f"moves: {len(df)}, players: {df.player.nunique()}")
+    print(f"moves: {n}, players: {df.player.nunique()}")
     print(summ.groupby("time_class")[["habit_match_rate", "median_time_familiar",
-                                      "median_time_novel"]].median().to_string())
+                                      "median_time_novel", "near_match_rate"]].median().to_string())
 
 
 if __name__ == "__main__":
