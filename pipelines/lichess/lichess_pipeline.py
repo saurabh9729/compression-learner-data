@@ -29,6 +29,19 @@ Key measures
 - clock_frac      : remaining clock as a fraction of the starting clock (within-game cost).
 - eval_loss_cp    : centipawn loss of the move, from [%eval] before and after (if available).
 
+Other stored representations (added 15 Nov, v3). For each key K below: K_seen (earlier visits),
+K_habit (usual legal move pattern), K_match (played it; defined when K_seen >= MIN_SEEN), K_share.
+- pawn            : pawn skeleton + side to move (coarsest state summary).
+- own             : the mover's own setup (all own pieces and pawns); the opponent is ignored.
+- reply           : the opponent's last move pattern (stimulus -> response, board ignored).
+- chunk           : the mover's own last two move patterns in this game (action sequence, board ignored).
+- kind_same_* / kind_other_*: the pawns + material summary learned only in games of the same speed
+                    group (bullet+blitz vs rapid+classical) / only in the other group.
+- kind_dist       : squares that differ from the last position of the same kind the player met.
+- result          : game result for the mover (1, 0.5, 0); opp_rating; time_forfeit (game ended on time).
+- epd             : the position, stored only for similar-but-not-identical positions and a 1% sample
+                    (for engine checks); the output stays in the user's private Drive.
+
 Privacy (the output repo is public)
 - Player names are replaced by anonymous IDs: HMAC-SHA256 of the name with a secret salt
   (env LICHESS_ID_SALT). Without the salt the IDs cannot be turned back into names.
@@ -168,6 +181,35 @@ def struct_key(board):
     return hash64(f"{int(board.turn)}:{wp:x}:{bp:x}:{mat}")
 
 
+def pawn_key(board):
+    """Pawn skeleton + side to move only (coarsest summary)."""
+    wp = int(board.pieces(chess.PAWN, chess.WHITE))
+    bp = int(board.pieces(chess.PAWN, chess.BLACK))
+    return hash64(f"P{int(board.turn)}:{wp:x}:{bp:x}")
+
+
+def own_key(board):
+    """Own setup: where the mover's pieces (incl. pawns) stand; opponent ignored."""
+    c = board.turn
+    parts = [f"{pt}:{int(board.pieces(pt, c)):x}" for pt in chess.PIECE_TYPES]
+    return hash64(f"O{int(c)}:" + "|".join(parts))
+
+
+def expand_board(board):
+    """64-character string, one per square ('.' = empty), for counting differing squares."""
+    out = []
+    for ch in board.board_fen():
+        if ch.isdigit():
+            out.append("." * int(ch))
+        elif ch != "/":
+            out.append(ch)
+    return "".join(out)
+
+
+def square_distance(a, b):
+    return sum(x != y for x, y in zip(a, b))
+
+
 def move_pattern(board, move):
     """Piece letter + from + to, e.g. 'Nb1c3'. Promotion suffix kept by uci()."""
     return sys.intern(board.piece_at(move.from_square).symbol().upper() + move.uci())
@@ -225,10 +267,28 @@ def _schema():
         ("struct_seen", i64), ("struct_habit_move", s), ("struct_habit_match", f64),
         ("struct_habit_share", f64), ("time_spent", f64), ("clock", f64), ("berserk", i64),
         ("clock_frac", f64), ("eval_after", f64), ("eval_loss_cp", f64),
+        # added 15 Nov (v3): more summary keys, chunks, speed-split history, distance, outcomes
+        *[(f"{k}_{c}", t) for k in EXTRA_KEYS for c, t in
+          (("seen", i64), ("habit", s), ("match", f64), ("share", f64))],
+        ("kind_same_seen", i64), ("kind_same_match", f64),
+        ("kind_other_seen", i64), ("kind_other_match", f64),
+        ("kind_dist", i64), ("result", f64), ("opp_rating", f64), ("time_forfeit", i64),
+        ("epd", s),
     ])
 
 
+EXTRA_KEYS = ("pawn", "own", "reply", "chunk")
+
+
 SPEED = {"bullet": "fast", "blitz": "medium", "rapid": "slow", "classical": "slow"}
+
+
+def lookup(mem, key, board):
+    """Earlier visits under this key: count, usual pattern that is legal now, its share."""
+    past = mem.get(key)
+    seen = sum(past.values())
+    habit = next((q for q, _ in past.most_common() if legal_pattern(board, q)), None) if seen else None
+    return seen, habit, (past[habit] / seen if habit else None)
 
 
 def extract_moves(paths, players, out_path, ids, chunk_rows=100_000):
@@ -242,6 +302,9 @@ def extract_moves(paths, players, out_path, ids, chunk_rows=100_000):
     print(f"games to process: {len(games)}", file=sys.stderr, flush=True)
 
     memory, smemory = Memory(), Memory()   # exact position / kind of position
+    xmem = {k: Memory() for k in EXTRA_KEYS}  # other summaries and chunks
+    spmem = Memory()                           # kind of position, split by speed group
+    lastboard = {}                             # (player, kind) -> last board as 64 characters
     pidx = {name: i for i, name in enumerate(sorted(players))}   # small int per player for keys
     rows, n_rows = [], 0
     writer = pq.ParquetWriter(out_path, schema)
@@ -266,6 +329,11 @@ def extract_moves(paths, players, out_path, ids, chunk_rows=100_000):
         prev_clock = {chess.WHITE: None, chess.BLACK: None}  # set from each side's first clock
         berserk = {chess.WHITE: 0, chess.BLACK: 0}
         prev_eval = 20.0  # small white edge at the start
+        res = h.get("Result", "")
+        white_score = {"1-0": 1.0, "0-1": 0.0, "1/2-1/2": 0.5}.get(res)
+        forfeit = int("time" in h.get("Termination", "").lower())
+        own_hist = {chess.WHITE: [], chess.BLACK: []}   # this game's own move patterns
+        last_pat = None                                  # opponent's last move pattern
         node = g
         ply = 0
         while node.variations:
@@ -304,7 +372,46 @@ def extract_moves(paths, players, out_path, ids, chunk_rows=100_000):
                     rt = float(rating)
                 except (TypeError, ValueError):
                     rt = None
-                rows.append(dict(
+                opp = h.get("BlackElo") if mover == chess.WHITE else h.get("WhiteElo")
+                try:
+                    opp_rt = float(opp)
+                except (TypeError, ValueError):
+                    opp_rt = None
+                pi = pidx[name]
+                xkeys = {
+                    "pawn": pawn_key(board),
+                    "own": own_key(board),
+                    "reply": hash64(f"R{int(mover)}:{last_pat}") if last_pat else None,
+                    "chunk": (hash64(f"C{int(mover)}:{own_hist[mover][-2]}>{own_hist[mover][-1]}")
+                              if len(own_hist[mover]) >= 2 else None),
+                }
+                extra = {}
+                for k, kv in xkeys.items():
+                    if kv is None:
+                        extra.update({f"{k}_seen": 0, f"{k}_habit": None, f"{k}_match": None, f"{k}_share": None})
+                        continue
+                    xs, xh, xsh = lookup(xmem[k], kv * 4096 + pi, board)
+                    extra.update({f"{k}_seen": xs, f"{k}_habit": xh,
+                                  f"{k}_match": (float(pat == xh) if xs >= MIN_SEEN and xh else None),
+                                  f"{k}_share": xsh})
+                sg = 0 if cls in ("bullet", "blitz") else 1
+                same_s, same_h, _ = lookup(spmem, kkey * 2 + sg, board)
+                oth_s, oth_h, _ = lookup(spmem, kkey * 2 + (1 - sg), board)
+                cur = expand_board(board)
+                prev_b = lastboard.get(kkey)
+                store_epd = (seen == 0 and sseen >= MIN_SEEN) or pos % 100 == 0
+                extra.update(
+                    kind_same_seen=same_s,
+                    kind_same_match=(float(pat == same_h) if same_s >= MIN_SEEN and same_h else None),
+                    kind_other_seen=oth_s,
+                    kind_other_match=(float(pat == oth_h) if oth_s >= MIN_SEEN and oth_h else None),
+                    kind_dist=(square_distance(cur, prev_b) if prev_b else None),
+                    result=(None if white_score is None else
+                            (white_score if mover == chess.WHITE else 1.0 - white_score)),
+                    opp_rating=opp_rt, time_forfeit=forfeit,
+                    epd=(board.epd() if store_epd else None),
+                )
+                rows.append(dict(**extra,
                     player=ids[name], game=gi, time_class=cls, speed=SPEED[cls],
                     base=base, inc=inc, rating=rt, ply=ply, pos=pos, kind=kind,
                     move=move, n_legal=board.legal_moves.count(),
@@ -320,11 +427,19 @@ def extract_moves(paths, players, out_path, ids, chunk_rows=100_000):
                 ))
                 memory.add(pkey, move)
                 smemory.add(kkey, pat)
+                for k, kv in xkeys.items():
+                    if kv is not None:
+                        xmem[k].add(kv * 4096 + pi, pat)
+                spmem.add(kkey * 2 + sg, pat)
+                lastboard[kkey] = cur
                 if len(rows) >= chunk_rows:
                     flush()
                     print(f"{n_rows:,} moves written ({gi + 1:,} of {len(games):,} games)",
                           file=sys.stderr, flush=True)
             prev_eval = ev if ev is not None else None
+            mp = move_pattern(board, nxt.move)
+            own_hist[mover].append(mp)
+            last_pat = mp
             board.push(nxt.move)
             node = nxt
             ply += 1
