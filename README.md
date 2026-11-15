@@ -6,6 +6,7 @@ Pipelines that pull large public datasets on GitHub's servers and keep only comp
 - `pipelines/<dataset>/`: scripts and a `run.env` settings file per dataset.
 - `.github/workflows/<dataset>.yml`: the GitHub Actions job that downloads, filters and preprocesses (triggered by pushing a change to `run.env`, or by hand).
 - `processed/<dataset>/`: outputs committed by the job (each file < 95 MB).
+- `colab/`: free alternative to Actions. Open `colab/lichess_extract.ipynb` in Google Colab; it runs the same pipeline code and saves the anonymised outputs to your Google Drive.
 
 ## ⚠ This repo is PUBLIC
 Everything committed here, and every Actions log, can be read by anyone.

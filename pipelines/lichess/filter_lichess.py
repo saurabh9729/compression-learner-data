@@ -11,6 +11,7 @@ Usage (run on GitHub Actions, never storing the full dump):
 import argparse
 import collections
 import csv
+import itertools
 import sys
 
 
@@ -50,12 +51,28 @@ def main():
     ap.add_argument("--count")
     ap.add_argument("--extract")
     ap.add_argument("--require-clock", action="store_true", default=True)
+    ap.add_argument("--max-games", type=int, default=0,
+                    help="stop after this many games (0 = whole file); use the same value in both passes")
     a = ap.parse_args()
     src = sys.stdin
+    _run(a, src)
 
+
+def limited(stream, max_games):
+    """All games, or only the first max_games; prints progress (counts only) to stderr."""
+    it = games(stream)
+    if max_games:
+        it = itertools.islice(it, max_games)
+    for i, g in enumerate(it, 1):
+        if i % 1_000_000 == 0:
+            print(f"{i:,} games read", file=sys.stderr, flush=True)
+        yield g
+
+
+def _run(a, src):
     if a.count:
         counts = collections.defaultdict(collections.Counter)
-        for h, _ in games(src):
+        for h, _ in limited(src, a.max_games):
             cls = speed_class(h.get("TimeControl"))
             if cls is None:
                 continue
@@ -71,7 +88,7 @@ def main():
     if a.extract:
         keep = {l.strip() for l in open(a.extract) if l.strip()}
         out = sys.stdout
-        for h, lines in games(src):
+        for h, lines in limited(src, a.max_games):
             if h.get("White") in keep or h.get("Black") in keep:
                 text = "".join(lines)
                 if a.require_clock and "[%clk" not in text:
