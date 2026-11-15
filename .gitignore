@@ -1,0 +1,5 @@
+# Never commit raw or identifying intermediates (this repo is public).
+*.pgn
+*.pgn.zst
+counts*.csv
+players*.txt

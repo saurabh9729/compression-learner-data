@@ -30,37 +30,46 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq zstd
           pip install -q chess pandas pyarrow zstandard
 
-      - name: Pass 1, count games per player (streamed, nothing stored)
+      - name: Pass 1, count games per player (streamed, kept in runner temp only)
         run: |
-          mkdir -p processed/lichess
+          W="$RUNNER_TEMP/lichess"; mkdir -p "$W"
           URL="https://database.lichess.org/standard/lichess_db_standard_rated_${MONTH}.pgn.zst"
-          curl -sL "$URL" | zstdcat | python pipelines/lichess/filter_lichess.py --count processed/lichess/counts_${MONTH}.csv
-          wc -l processed/lichess/counts_${MONTH}.csv
+          curl -sL "$URL" | zstdcat | python pipelines/lichess/filter_lichess.py --count "$W/counts.csv"
+          wc -l < "$W/counts.csv"
 
       - name: Select players who play both bullet and slow games
         run: |
-          python pipelines/lichess/select_players.py processed/lichess/counts_${MONTH}.csv \
+          W="$RUNNER_TEMP/lichess"
+          python pipelines/lichess/select_players.py "$W/counts.csv" \
             --min-bullet "$MIN_BULLET" --min-slow "$MIN_SLOW" --n "$N_PLAYERS" \
-            --out processed/lichess/players_${MONTH}.txt
+            --out "$W/players.txt"
 
-      - name: Pass 2, keep only their games (streamed)
+      - name: Pass 2, keep only their games (streamed, runner temp only)
         run: |
+          W="$RUNNER_TEMP/lichess"
           URL="https://database.lichess.org/standard/lichess_db_standard_rated_${MONTH}.pgn.zst"
-          curl -sL "$URL" | zstdcat | python pipelines/lichess/filter_lichess.py --extract processed/lichess/players_${MONTH}.txt \
-            | zstd -q -19 -o processed/lichess/filtered_${MONTH}.pgn.zst
+          curl -sL "$URL" | zstdcat | python pipelines/lichess/filter_lichess.py --extract "$W/players.txt" > "$W/filtered.pgn"
+          ls -lh "$W"
+
+      - name: Per-move measures, with anonymous player IDs
+        env:
+          LICHESS_ID_SALT: ${{ secrets.LICHESS_ID_SALT }}
+        run: |
+          W="$RUNNER_TEMP/lichess"
+          mkdir -p processed/lichess
+          python pipelines/lichess/lichess_pipeline.py "$W/filtered.pgn" \
+            --players "$W/players.txt" --out processed/lichess/moves_${MONTH}.parquet
           ls -lh processed/lichess/
 
-      - name: Per-move measures
+      - name: Safety check, no player names in anything committed
         run: |
-          python pipelines/lichess/lichess_pipeline.py processed/lichess/filtered_${MONTH}.pgn.zst \
-            --players processed/lichess/players_${MONTH}.txt --out processed/lichess/moves_${MONTH}.parquet
-          ls -lh processed/lichess/
+          python pipelines/lichess/check_no_names.py "$RUNNER_TEMP/lichess/players.txt" \
+            processed/lichess/moves_${MONTH}.parquet processed/lichess/moves_${MONTH}_players.csv
 
-      - name: Commit results (counts file dropped if too large)
+      - name: Commit only the two anonymised outputs
         run: |
-          find processed -size +95M -print -delete
           git config user.name "lichess-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add processed
-          git commit -m "Lichess extract ${MONTH}" || echo "nothing to commit"
+          git add processed/lichess/moves_${MONTH}.parquet processed/lichess/moves_${MONTH}_players.csv
+          git commit -m "Lichess extract ${MONTH} (anonymised)" || echo "nothing to commit"
           git pull --rebase && git push

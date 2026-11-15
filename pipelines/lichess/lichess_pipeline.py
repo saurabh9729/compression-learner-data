@@ -16,11 +16,21 @@ Key measures
 - clock_frac      : remaining clock as a fraction of the starting clock (within-game cost).
 - eval_loss_cp    : centipawn loss of the move, from [%eval] before and after (if available).
 
+Privacy (the output repo is public)
+- Player names are replaced by anonymous IDs: HMAC-SHA256 of the name with a secret salt
+  (env LICHESS_ID_SALT). Without the salt the IDs cannot be turned back into names.
+  If the salt is missing, a random one is used and thrown away (IDs then differ between runs).
+- No game links (Site), no opponent names, no dates are written. Logs print only totals.
+
 Usage
   python lichess_pipeline.py games.pgn.zst --out moves.parquet --min-games 20
 """
 import argparse
 import collections
+import hashlib
+import hmac
+import os
+import secrets
 import io
 import math
 import re
@@ -154,7 +164,7 @@ def extract_moves(paths, players):
                 seen = sum(past.values())
                 habit = past.most_common(1)[0][0] if seen else None
                 rows.append(dict(
-                    player=name, game=gi, site=h.get("Site"), time_class=cls,
+                    player=name, game=gi, time_class=cls,
                     base=base, inc=inc, rating=pd.to_numeric(rating, errors="coerce"),
                     ply=ply, epd=epd, move=move, n_legal=n_legal,
                     seen_before=seen, habit_move=habit,
@@ -184,6 +194,16 @@ def player_summary(df):
     return out.merge(nov, on=["player", "time_class"], how="outer")
 
 
+def anonymize(names):
+    """Map each player name to a stable anonymous ID (secret salt; see Privacy above)."""
+    salt = os.environ.get("LICHESS_ID_SALT", "")
+    if not salt:
+        print("warning: LICHESS_ID_SALT not set; using a one-off random salt", file=sys.stderr)
+        salt = secrets.token_hex(32)
+    key = salt.encode()
+    return {n: "p_" + hmac.new(key, n.encode(), hashlib.sha256).hexdigest()[:12] for n in names}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("pgn", nargs="+")
@@ -200,10 +220,15 @@ def main(argv=None):
     df = extract_moves(a.pgn, players)
     df["speed"] = df.time_class.map({"bullet": "fast", "blitz": "medium",
                                      "rapid": "slow", "classical": "slow"})
+    ids = anonymize(sorted(players))
+    df["player"] = df["player"].map(ids)
     df.to_parquet(a.out, index=False)
     summ = player_summary(df)
     summ.to_csv(a.out.replace(".parquet", "_players.csv"), index=False)
-    print(summ.to_string(index=False))
+    # Totals only: logs of a public repo are public.
+    print(f"moves: {len(df)}, players: {df.player.nunique()}")
+    print(summ.groupby("time_class")[["habit_match_rate", "median_time_familiar",
+                                      "median_time_novel"]].median().to_string())
 
 
 if __name__ == "__main__":
