@@ -34,6 +34,50 @@ def lines_of_four():
 
 
 LINES = lines_of_four()
+ORIENT = []                      # H, V or D for each line, in the same order
+for r in range(ROWS):
+    ORIENT += ["H"] * (COLS - 3)
+ORIENT += ["V"] * COLS + ["D"] * (2 * (COLS - 3))
+LMASK = [sum(1 << q for q in ln) for ln in LINES]
+
+
+def mask(squares):
+    return sum(1 << q for q in squares)
+
+
+def win_mask(P, E):
+    """Bit-mask of empty squares that complete four for the player with pieces P (E = empty squares)."""
+    out = 0
+    for L in LMASK:
+        if bin(P & L).count("1") == 3 and bin(E & L).count("1") == 1:
+            out |= E & L
+    return out
+
+
+def fork_moves(P, Q, E):
+    """Squares where P (to move) creates two or more winning squares while Q has no immediate win: a forced win in 2."""
+    cand = 0
+    for L in LMASK:
+        if bin(P & L).count("1") == 2 and bin(E & L).count("1") == 2:
+            cand |= E & L
+    out = set()
+    while cand:
+        b = cand & -cand; cand ^= b
+        E2 = E & ~b
+        if win_mask(Q, E2):
+            continue
+        if bin(win_mask(P | b, E2)).count("1") >= 2:
+            out.add(b.bit_length() - 1)
+    return out
+
+
+def line_orients(P, E, squares):
+    """Directions of the lines in which P has three pieces and the empty fourth square is in `squares`."""
+    out = set()
+    for L, o in zip(LMASK, ORIENT):
+        if bin(P & L).count("1") == 3 and bin(E & L).count("1") == 1 and ((E & L).bit_length() - 1) in squares:
+            out.add(o)
+    return out
 LINES_AT = collections.defaultdict(list)
 for ln in LINES:
     for s in ln:
@@ -81,7 +125,7 @@ def build():
     m = m[(m.practice == False) & m.sid.isin(p.sid[p.age.notna()])].copy()
     m = m.sort_values(["sid", "game", "move_in_game"]).reset_index(drop=True)
     stores = ["exact", "reply", "relational", "chunk", "local", "default"]
-    out, bad = [], [0]
+    out, n_occupied = [], [0]
     for sid, g in m.groupby("sid", sort=False):
         mem = {s: collections.defaultdict(collections.Counter) for s in stores}
         game_rank = {gn: i for i, gn in enumerate(sorted(g.game.unique()))}
@@ -97,15 +141,40 @@ def build():
             opp_last = next(iter(new_opp)) if len(new_opp) == 1 else None
             tile = int(r.tile)
             if tile not in empty:
-                bad[0] += 1
+                n_occupied[0] += 1
             win_sq = winning_squares(mine, empty)
             threat_sq = winning_squares(theirs, empty)
             critical = "win" if win_sq else ("block" if len(threat_sq) == 1 else None)
             correct = win_sq if win_sq else (threat_sq if len(threat_sq) == 1 else set())
+            Pm, Qm, Em = mask(mine), mask(theirs), mask(empty)
+            level, bad = None, (lambda q: None)
+            if critical:
+                level = 1
+                bad = (lambda q, cor=frozenset(correct): float(q not in cor))
+                orient = line_orients(Pm if critical == "win" else Qm, Em, correct)
+            elif not threat_sq:
+                my_f = fork_moves(Pm, Qm, Em)
+                opp_f = fork_moves(Qm, Pm, Em)
+                if my_f:
+                    level = 2
+                    bad = (lambda q, f=frozenset(my_f): float(q not in f))
+                elif opp_f:
+                    allows = {}
+                    def allow(q):
+                        if q not in allows:
+                            b = 1 << q
+                            allows[q] = bool(fork_moves(Qm, Pm | b, Em & ~b))
+                        return allows[q]
+                    if any(not allow(q) for q in sorted(empty)):
+                        level = 2
+                        bad = (lambda q: float(allow(q)))
+            row2 = dict(err_level=level, played_err=(bad(tile) if level else np.nan),
+                        orient=("".join(sorted(orient)) if critical else None),
+                        kind2=(("fork" if level == 2 and not threat_sq and fork_moves(Pm, Qm, Em) else "allow") if level == 2 else None))
             row = dict(sid=sid, game=r.game, game_rank=game_rank[r.game], level=r.level, color=r.color,
                        move_in_game=r.move_in_game, tile=tile, rt_ms=r.rt_ms, result=getattr(r, "result", None),
                        n_empty=len(empty), critical=critical, correct_move=(tile in correct) if critical else np.nan,
-                       n_threats=len(threat_sq))
+                       n_threats=len(threat_sq), **row2)
             keys = {
                 "exact": (r.color, r.bp, r.wp),
                 "reply": (r.color, opp_last) if opp_last is not None else None,
@@ -129,6 +198,7 @@ def build():
                     if sq is not None and sq in empty:
                         usual = sq
                         row[f"{s}_share"] = cnt / seen
+                        row[f"{s}_ucount"] = cnt          # times this usual move was chosen before (reuse count)
                         break
                 if usual is not None and seen >= MIN_SEEN:
                     row[f"{s}_usual"] = usual
@@ -136,6 +206,9 @@ def build():
                     usual_set.add(usual)
                     if critical:
                         row[f"{s}_usual_ok"] = float(usual in correct)
+                    if level:
+                        row[f"{s}_usual_err"] = bad(usual)
+                row[f"{s}_key"] = repr(k)
                 if s == "default":   # log prob of the played square under the default policy (add-one over empty squares)
                     denom = sum(past[q] for q in empty) + len(empty)
                     row["default_logp"] = math.log((past[tile] + 1) / denom)
@@ -157,7 +230,7 @@ def build():
             out.append(row)
             prev_opp = set(theirs)
             prev_mine_tile = tile
-    print('moves onto an occupied square (board-before check):', bad[0])
+    print('moves onto an occupied square (board-before check):', n_occupied[0])
     d = pd.DataFrame(out)
     # each person's speed relative to their own usual speed
     d["log_rt"] = np.log(d.rt_ms.clip(lower=100))
