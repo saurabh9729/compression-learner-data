@@ -58,7 +58,9 @@ def main(argv=None):
     import pyarrow.parquet as pq
     if "variant" in pq.ParquetFile(a.parquet[0]).schema_arrow.names:
         cols.append("variant")
-    d = pd.concat([pd.read_parquet(p, columns=cols) for p in a.parquet], ignore_index=True)
+    # read only rows that can be sampled (same rows the filter below keeps), so big files fit in memory
+    keep = [("seen_before", "==", 0), ("struct_seen", ">=", 3), ("ply", ">=", 2)]
+    d = pd.concat([pd.read_parquet(p, columns=cols, filters=keep) for p in a.parquet], ignore_index=True)
     if "variant" not in d:
         d["variant"] = "standard"
     other = ~d.variant.isin(["standard", "chess960"])
